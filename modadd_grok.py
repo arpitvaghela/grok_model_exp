@@ -21,6 +21,9 @@ import json
 from model import params_pad_to_shape, Transformer, GradientLogger
 import itertools
 
+from pyhessian import hessian
+import copy 
+
 @dataclass
 class ModelSpec:
     d_model: int
@@ -47,9 +50,8 @@ def full_loss(model, data, device):
     x, labels = next(iter(loader))
     x = x.to(device)
     labels = labels.to(device)
-    logits, attn_scores_masked = model(x)
-    logits = logits[:, -1]
-    return torch.nn.functional.cross_entropy(logits, labels), attn_scores_masked
+    logits, _ = model(x)# [:, -1]
+    return torch.nn.functional.cross_entropy(logits, labels)
 
 def full_accuracy(model, data, device):
     loader = torch.utils.data.DataLoader(data, batch_size=len(data), shuffle=False)
@@ -57,18 +59,23 @@ def full_accuracy(model, data, device):
     x, labels = next(iter(loader))
     x = x.to(device)
     labels = labels.to(device)
-    logits = model(x)[0][:, -1]
+    logits = model(x)# [:, -1]
     predictions = torch.argmax(logits, dim=1)
     return torch.sum(predictions == labels).item() / len(labels)
 
 
-def train_and_plot(sizes,
-                   train,
-                   test,
-                   t_steps=5000,
-                   exp_freq=None,
-                   exp_thres=0.2,
-                   log_dir="./logs/"):
+def make_loss_fn(data, device):
+    def loss_fn(model):
+        return full_loss(model, data, device)
+
+    return loss_fn
+
+def get_params(model_orig, model_perb, direction, alpha):
+    for m_orig, m_perb, d in zip(model_orig.parameters(), model_perb.parameters(), direction):
+        m_perb.data = m_orig.data + alpha * d
+    return model_perb
+
+def train_and_plot(sizes, t_steps=5000, exp_freq=None, log_dir="./logs/"):
     log_steps = []
     train_losses = []
     test_losses = []
@@ -76,238 +83,174 @@ def train_and_plot(sizes,
     test_accuracies = []
     norms = []
     grad_norms = []
-    attention_scores = []
 
     # if not exp_freq:
     #     exp_freq = t_steps // len(sizes)
     size_index = 0
-    model = Transformer(
-        num_layers=1,
-        d_vocab=equals_token + 1,
-        d_model=sizes[0].d_model,
-        d_mlp=sizes[0].d_mlp,
-        d_k=sizes[0].d_head,
-        d_v=sizes[0].d_head,
-        num_heads=sizes[0].n_head,
-        n_ctx=3,  # context length
-        act_type='ReLU',
-        use_cache=False,
-        use_ln=False  # use LayerNorm
-    ).to(device)
-    grad_logger = GradientLogger()
-    grad_logger.register_hooks(model)
-
-    optimizer = torch.optim.AdamW(model.parameters(),
-                                  lr=1e-3,
-                                  weight_decay=1.0,
-                                  betas=(0.9, 0.98))
-
-    pbar = tqdm(range(t_steps),
-                desc="Training",
-                postfix={
-                    "val_acc": 0,
-                    "train_acc": 0,
-                    "w_norm": 0,
-                    "g_norm": 0
-                })
-    for epoch in pbar:
+    model = Transformer(num_layers=1, 
+                        d_vocab=equals_token+1, 
+                        d_model=sizes[0].d_model,
+                        d_mlp=sizes[0].d_mlp,
+                        d_k=sizes[0].d_head,
+                        d_v=sizes[0].d_head,
+                        num_heads=sizes[0].n_head,
+                        n_ctx=3, # context length
+                        act_type='ReLU', 
+                        use_cache=False, 
+                        use_ln=False # use LayerNorm
+                    ).to(device)
+    
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1.0, betas=(0.9, 0.98))
+        
+    for epoch in tqdm(range(t_steps)):
         # if epoch % exp_freq == 0:
-        if len(test_accuracies
-               ) and test_accuracies[-1] > exp_thres and size_index == 0:
+        if len(test_accuracies) and test_accuracies[-1] > 0.25 and size_index == 0:
             # idx = epoch // exp_freq
-            size_index = 1
+            size_index = 1 
             exp_freq = epoch
             if size_index > 0 and size_index < len(sizes):
-                print(
-                    f"@epoch {epoch}\t{sizes[size_index -1]} -> {sizes[size_index]}"
-                )
-
-                model_2 = Transformer(
-                    num_layers=1,
-                    d_vocab=equals_token + 1,
-                    d_model=sizes[size_index].d_model,
-                    d_mlp=sizes[size_index].d_mlp,
-                    d_k=sizes[size_index].d_head,
-                    d_v=sizes[size_index].d_head,
-                    num_heads=sizes[size_index].n_head,
-                    n_ctx=3,  # context length
-                    act_type='ReLU',
-                    use_cache=False,
-                    use_ln=False  # use LayerNorm
-                ).to(device)
+                print( f"@epoch {epoch}\t{sizes[size_index -1]} -> {sizes[size_index]}")
+                
+                model_2 = Transformer(num_layers=1, 
+                            d_vocab=equals_token+1, 
+                            d_model=sizes[size_index].d_model,
+                            d_mlp=sizes[size_index].d_mlp,
+                            d_k=sizes[size_index].d_head,
+                            d_v=sizes[size_index].d_head,
+                            num_heads=sizes[size_index].n_head,
+                            n_ctx=3, # context length
+                            act_type='ReLU', 
+                            use_cache=False, 
+                            use_ln=False # use LayerNorm
+                        ).to(device)
                 model_2.load_state_dict(
-                    params_pad_to_shape(model.state_dict(),
-                                        model_2.state_dict()))
+                    params_pad_to_shape(model.state_dict(), model_2.state_dict())
+                )
                 model = model_2
-                optimizer = torch.optim.AdamW(model.parameters(),
-                                              lr=1e-3,
-                                              weight_decay=1.0,
-                                              betas=(0.9, 0.98))
-                grad_logger.register_hooks(model)
-
-        train_loss, attn_scores_masked = full_loss(model, train, device)
+                optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1.0, betas=(0.9, 0.98))
+            
+        train_loss = full_loss(model, train, device)
         if epoch % 30 == 0:
             with torch.no_grad():
                 log_steps.append(epoch)
-                test_loss, attn_scores_masked = full_loss(model, test, device)
+                test_loss = full_loss(model, test, device)
                 train_losses.append(train_loss.item())
                 test_losses.append(test_loss.item())
-                train_acc = full_accuracy(model, train, device)
-                test_acc = full_accuracy(model, test, device)
-                train_accuracies.append(train_acc)
-                test_accuracies.append(test_acc)
-                weight_norm = np.sqrt(
-                    sum(
-                        param.pow(2).sum().item()
-                        for param in model.parameters()))
-                norms.append(weight_norm)
+                train_accuracies.append(full_accuracy(model, train, device))
+                test_accuracies.append(full_accuracy(model, test, device))
+                norms.append(np.sqrt(sum(param.pow(2).sum().item() for param in model.parameters())))
+            
 
-                # Store mean attention scores across all heads and batches
-                mean_attn = torch.mean(torch.stack(attn_scores_masked),
-                                       dim=0)  # Average across layers
-                mean_attn = mean_attn.mean(dim=0)  # Average across batches
-                attention_scores.append(mean_attn.cpu().numpy())
+            # Loss landscape with Hessian of layers
+            # load loss function
+            # loss_fn = make_loss_fn(train, device)
+            criterion = torch.nn.functional.cross_entropy
+            train_loader = torch.utils.data.DataLoader(train, batch_size=len(train), shuffle=False)
+            
+            hessian_comp = hessian(model=model, criterion=criterion, cuda=True, dataloader=train_loader)
+
+            top_eigenvalues, top_eigenvector = hessian_comp.eigenvalues()
+
+            # saving top eigenvalues
+            eigenvalues_np = np.array(top_eigenvalues)
+            np.save(os.path.join(log_dir + "/hessian_eigenvalues", f"eigvals_epoch{epoch}.npy"), eigenvalues_np)
+
+            lams = np.linspace(-0.5, 0.5, 21).astype(np.float32)
+
+            loss_list = []
+
+            # computing and saving loss landscape plots
+            model_perb = copy.deepcopy(model).to(device)
+            for lam in lams:
+                model_perb = get_params(model, model_perb, top_eigenvector[0], lam)
+                loss_val = full_loss(model_perb, train, device)
+                loss_list.append(loss_val.item())
+
+            plt.plot(lams, loss_list)
+            plt.xlabel("Perturbation")
+            plt.ylabel("Loss")
+            plt.title(f"Epoch {epoch} loss landscape")
+            plt.savefig(os.path.join(log_dir + "/loss_landscapes", f"landscape_epoch{epoch}.png"))
+            plt.close()
 
         train_loss.backward()
 
-        if epoch % 30 == 0:
-            # Compute total gradient norm (L2)
-            total_grad_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    param_norm = p.grad.data.norm(2)
-                    total_grad_norm += param_norm.item()**2
-            grad_norm = np.sqrt(total_grad_norm)
-            grad_norms.append(grad_norm)
-            # Update tqdm postfix with latest metrics
-            pbar.set_postfix(val_acc=f"{test_acc:.3f}",
-                             train_acc=f"{train_acc:.3f}",
-                             w_norm=f"{weight_norm:.3f}",
-                             g_norm=f"{grad_norm:.3f}")
+        # if epoch%30 ==0:
+        #      with torch.no_grad():
+        #         # Compute total gradient norm (L2)
+        #         total_grad_norm = 0.0
+        #         for p in model.parameters():
+        #             if p.grad is not None:
+        #                 param_norm = p.grad.data.norm(2)
+        #                 total_grad_norm += param_norm.item() ** 2
+
+        #         grad_norms.append(total_grad_norm)
 
         optimizer.step()
         optimizer.zero_grad()
 
-    grad_logger.save("grads.pt")
-    grad_logger.plot_grad_norms()
-    grad_logger.plot_grad_hist()
-    
-    # Pad attention scores to match largest shape before storing
-    if attention_scores:
-        # Find max shape across all attention matrices
-        max_shape = max(score.shape for score in attention_scores)
-
-        # Pad smaller matrices with zeros to match max shape
-        padded_scores = []
-        for score in attention_scores:
-            if score.shape != max_shape:
-                padded = np.zeros(max_shape)
-                padded[:score.shape[0], :score.shape[1]] = score
-                padded_scores.append(padded)
-            else:
-                padded_scores.append(score)
-
-        attention_scores = padded_scores
 
     data = {
         "log_steps": log_steps,
-        "train_accuracies": train_accuracies,
-        "test_accuracies": test_accuracies,
+        "train_accuracies":train_accuracies,
+        "test_accuracies":test_accuracies,
         "weight_norms": norms,
-        "grad_norms": grad_norms,
         "model_sizes": [vars(s) for s in sizes],
         "exp_freq": exp_freq,
-        "total_steps": t_steps,
-        "attention_scores": attention_scores
+        "total_steps": t_steps
     }
 
     now = datetime.now().strftime("%Y-%m-%d_%H-%M")
     tag = "1L_modadd"
-    raw_string = "\n".join(
-        ["_".join(f"{k}_{v}" for k, v in vars(s).items()) for s in sizes])
-    short_hash = hashlib.md5(
-        raw_string.encode()).hexdigest()[-6:].upper()  # e.g. 'E1234A'
+    raw_string = "\n".join(["_".join(f"{k}_{v}" for k, v in vars(s).items()) for s in sizes])
+    short_hash = hashlib.md5(raw_string.encode()).hexdigest()[-6:].upper()  # e.g. 'E1234A'
 
     # exp_name = f"{now}__{tag}__{short_hash}"
-    exp_name = " | ".join(
-        ["_".join(f"{v}" for k, v in vars(s).items())
-         for s in sizes]) + f"@step{exp_freq}"
+    exp_name = " | ".join(["_".join(f"{v}" for k, v in vars(s).items()) for s in sizes]) + f"@step{exp_freq}"
     exp_path = os.path.join(log_dir, exp_name)
 
     os.makedirs(exp_path, exist_ok=True)
-    # Save numpy arrays using numpy's save format
-    np.save(os.path.join(exp_path, "attention_scores.npy"),
-            np.array(data["attention_scores"]))
-
-    # Save rest of data as JSON, excluding the numpy arrays
-    data_json = data.copy()
-    del data_json["attention_scores"]
-
+    
     with open(os.path.join(exp_path, "config.json"), "w") as f:
-        json.dump(data_json, f, indent=2)
+        json.dump(data, f, indent=2)
+    
+    ax = plt.subplot(1, 1, 1)
+    expansion_steps = [exp_freq * i for i in range(1, len(sizes))]
 
-    # # Create figure with subplots
-    # fig, (ax1, ax2) = plt.subplots(2,
-    #                                1,
-    #                                figsize=(10, 12),
-    #                                height_ratios=[2, 1])
+    plt.plot(log_steps, train_accuracies, color='red', label='train')
+    plt.plot(log_steps, test_accuracies, color='green', label='test')
+    
 
-    # # Plot accuracies and norms
-    # expansion_steps = [exp_freq * i for i in range(1, len(sizes))]
+    
+    if any(a>=0.95 for a in test_accuracies):
+        time_to_95_pct_test = log_steps[min(i for i, acc in enumerate(test_accuracies) if acc >= 0.95)]
+        plt.plot([time_to_95_pct_test]*2, [0, 1], color='green', linestyle='--')
+        plt.text(time_to_95_pct_test+10, 0.65, f"@{time_to_95_pct_test} test acc\nhits 95%")
 
-    # ax1.plot(log_steps, train_accuracies, color='red', label='train')
-    # ax1.plot(log_steps, test_accuracies, color='green', label='test')
+    for step in expansion_steps:
+        plt.axvline(x=step, color='blue', linestyle='dotted', linewidth=1, alpha=0.2)
 
-    # if any(a >= 0.95 for a in test_accuracies):
-    #     time_to_95_pct_test = log_steps[min(
-    #         i for i, acc in enumerate(test_accuracies) if acc >= 0.95)]
-    #     ax1.plot([time_to_95_pct_test] * 2, [0, 1],
-    #              color='green',
-    #              linestyle='--')
-    #     ax1.text(time_to_95_pct_test + 10, 0.65,
-    #              f"@{time_to_95_pct_test} test acc\nhits 95%")
 
-    # for step in expansion_steps:
-    #     ax1.axvline(x=step,
-    #                 color='blue',
-    #                 linestyle='dotted',
-    #                 linewidth=1,
-    #                 alpha=0.2)
+    plt.legend()
 
-    # ax1.legend()
-    # ax1.set_xlabel("Optimization Steps")
-    # ax1.set_ylim(0, 1)
-    # ax1.set_ylabel("Accuracy")
-
-    # ax1_2 = ax1.twinx()
-    # ax1_2.set_ylabel("Weight/Grad Norm", color='purple')
-    # ax1_2.plot(log_steps, norms, color='purple', label='weight norm')
-    # ax1_2.plot(log_steps, grad_norms, color='orange', label='grad norm')
-    # ax1_2.set_ylim(27, 63)
-    # ax1.set_xscale('log')
-    # ax1_2.legend(loc=(0.015, 0.72))
-
-    # # Plot attention heatmap
-    # attention_scores = np.array(attention_scores) # shape b,i,q,h
-    # sns.heatmap(attention_scores.T,
-    #             ax=ax2,
-    #             cmap='viridis',
-    #             xticklabels=log_steps[::len(log_steps) // 10],
-    #             yticklabels=[
-    #                 'pos ' + str(i) for i in range(attention_scores.shape[1])
-    #             ])
-    # ax2.set_xlabel('Training Step')
-    # ax2.set_ylabel('Position')
-    # ax2.set_title('Attention Scores Over Training')
-
-    # size_str = "dmodel,dmlp,nhead: " + " | ".join(
-    #     ["_".join(f"{v}" for k, v in vars(s).items()) for s in sizes])
-    # fig.suptitle("1L Transformer on Modular Addition (p=113)\n" + size_str +
-    #              f"\nexp@{exp_freq} t-{t_steps}",
-    #              fontsize=8)
-    # plt.tight_layout()
-    # plt.savefig(os.path.join(log_dir, exp_name, "plot.png"), dpi=300)
-    # plt.close()
+    plt.xlabel("Optimization Steps")
+    # plt.xlim(8, 2*10**4)
+    
+    plt.ylim(0,1)
+    ax.set_ylabel("Accuracy")
+    ax2 = ax.twinx()
+    ax2.set_ylabel("Weight Norm", color='purple')
+    ax2.plot(log_steps, norms, color='purple', label='weight norm')
+    ax2.set_ylim(27, 63)
+    
+    plt.xscale('log')
+    plt.legend(loc=(0.015, 0.72))
+    
+    size_str = "dmodel,dmlp,nhead: " + " | ".join(["_".join(f"{v}" for k, v in vars(s).items()) for s in sizes])
+    plt.title("1L Transformer on Modular Addition (p=113)\n"+ size_str + f"\nexp@{exp_freq} t-{t_steps}", fontsize=8)
+    plt.tight_layout()
+    plt.savefig(os.path.join(log_dir, exp_name, "plot.png"), dpi=300)
+    plt.close()
 
 
 if __name__ == "__main__":
@@ -363,4 +306,4 @@ if __name__ == "__main__":
 
             print(f"Training {sizes}")
 
-            train_and_plot(sizes, train, test, 5_000, -1, log_dir=log_dir,exp_thres=et)
+            train_and_plot(sizes, 10000, -1, log_dir=log_dir)
