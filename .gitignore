@@ -5,3 +5,5 @@ __pycache__/
 .ipynb_checkpoints/
 env*
 *.pt
+nbs/log*
+nbs/log_exp@test>.4_re/*

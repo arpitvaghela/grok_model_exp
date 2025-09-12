@@ -65,7 +65,7 @@ class GradientLogger:
                 param.register_hook(lambda grad, n=name: self.grads[n].append(
                     grad.detach().cpu().clone()))
 
-    def save(self, path="grads.pt"):
+    def save(self, path):
         torch.save(dict(self.grads), path)
 
     def load(self, path="grads.pt"):
@@ -256,7 +256,7 @@ class Transformer(nn.Module):
 
         # x = self.ln(x)
         x = self.unembed(x)
-        return x, attn_scores_masked
+        return x[:,-1], attn_scores_masked
 
     def set_use_cache(self, use_cache):
         self.use_cache = use_cache
