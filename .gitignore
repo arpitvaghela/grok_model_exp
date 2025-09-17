@@ -7,3 +7,5 @@ env*
 *.pt
 nbs/log*
 nbs/log_exp@test>.4_re/*
+log/*
+load_grads_weights.ipynb/

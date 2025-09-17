@@ -1,4 +1,5 @@
 import os
+import shutil
 import random
 import time
 
@@ -64,10 +65,22 @@ def full_accuracy(model, data, device):
     predictions = torch.argmax(logits, dim=1)
     return torch.sum(predictions == labels).item() / len(labels)
 
+# GET MODEL PARAMETERS FOR HESSIAN CALCULATION
 def get_params(model_orig, model_perb, direction, alpha):
     for m_orig, m_perb, d in zip(model_orig.parameters(), model_perb.parameters(), direction):
         m_perb.data = m_orig.data + alpha * d
     return model_perb
+
+def get_histogram_counts(model, bins=1000):
+    histograms = {}
+    for name, param in model.named_parameters():
+        values = param.detach().cpu().flatten().numpy()
+        counts, bin_edges = np.histogram(values, bins=bins)
+        histograms[name] = {
+            "counts": counts,
+            "bin_edges": bin_edges
+        }
+    return histograms
 
 def train_and_plot(sizes,
                    train,
@@ -89,6 +102,15 @@ def train_and_plot(sizes,
     # if not exp_freq:
     #     exp_freq = t_steps // len(sizes)
     size_index = 0
+    
+    # PATH VARIABLES / SPECIFICATIONS
+    exp_name = " | ".join(
+                ["_".join(f"{v}" for k, v in vars(s).items())
+                for s in sizes]) + f"@step{exp_freq}"
+    exp_path = os.path.join(log_dir, exp_name, f"seed_{seed}")
+    os.makedirs(exp_path, exist_ok=True)
+
+    # INITIAL MODEL
     model = Transformer(
         num_layers=1,
         d_vocab=equals_token + 1,
@@ -119,17 +141,35 @@ def train_and_plot(sizes,
                     "g_norm": 0
                 })
     for epoch in pbar:
+        # MAKING DIRECTORY
+        exp_name = " | ".join(
+        ["_".join(f"{v}" for k, v in vars(s).items())
+        for s in sizes]) + f"@step{exp_freq}"
+        exp_path = os.path.join(log_dir, exp_name, f"seed_{seed}")
+        os.makedirs(exp_path, exist_ok=True)
+        
+        # CAPTURING WEIGHTS (HISTOGRAM COUNTS) PRE-EXPANSION
+        if epoch % 30 == 0:
+            pre_exp_weight_hist = get_histogram_counts(model, bins=1000)
+            torch.save(pre_exp_weight_hist, f"pre-weights-{epoch}.pt")
+            pre_exp_weight_hist_dir = os.path.join(exp_path, "pre_exp_weight_hist")
+            os.makedirs(pre_exp_weight_hist_dir, exist_ok=True)
+            shutil.move(f"pre-weights-{epoch}.pt", pre_exp_weight_hist_dir)
+        
+        # CONDITION FOR EXPANSION
         # if epoch % exp_freq == 0:
         if len(test_accuracies
                ) and test_accuracies[-1] > exp_thres and size_index == 0:
             # idx = epoch // exp_freq
             size_index = 1
             exp_freq = epoch
+
             if size_index > 0 and size_index < len(sizes):
                 print(
                     f"@epoch {epoch}\t{sizes[size_index -1]} -> {sizes[size_index]}"
                 )
-
+                
+                # MODEL EXPANDS HERE
                 model_2 = Transformer(
                     num_layers=1,
                     d_vocab=equals_token + 1,
@@ -175,37 +215,45 @@ def train_and_plot(sizes,
                                        dim=0)  # Average across layers
                 mean_attn = mean_attn.mean(dim=0)  # Average across batches
                 attention_scores.append(mean_attn.cpu().numpy())
-                
+
+
+                # MAKING DIRECTORY
+                exp_name = " | ".join(
+                ["_".join(f"{v}" for k, v in vars(s).items())
+                for s in sizes]) + f"@step{exp_freq}"
+                exp_path = os.path.join(log_dir, exp_name, f"seed_{seed}")
+                os.makedirs(exp_path, exist_ok=True)
+
+                # CAPTURING WEIGHTS (HISTOGRAM COUNTS) POST-EXPANSION
+                post_exp_weight_hist = get_histogram_counts(model, bins=1000)
+                torch.save(post_exp_weight_hist, f"post-weight-{epoch}.pt")
+                post_exp_weight_hist_dir = os.path.join(exp_path, "post_exp_weight_hist")
+                os.makedirs(post_exp_weight_hist_dir, exist_ok=True)
+                shutil.move(f"post-weight-{epoch}.pt", post_exp_weight_hist_dir)
+
+            # HESSIAN COMPUTATION
             criterion = torch.nn.functional.cross_entropy
             train_loader = torch.utils.data.DataLoader(train, batch_size=len(train), shuffle=False)
-                        
             hessian_comp = hessian(model=model, criterion=criterion, cuda=True, dataloader=train_loader)
-
             top_eigenvalues, top_eigenvector = hessian_comp.eigenvalues()
 
-            # calculating top eigenvalues
+            # CALCULATING TOP HESSIAN EIGENVALUES
             eigenvalues_np = np.array(top_eigenvalues)
-
             top_hessian_eigenvalues.append(eigenvalues_np)
 
+            # COMPUTING + SAVING LOSS LANDSCAPE
             lams = np.linspace(-0.5, 0.5, 21).astype(np.float32)
-
             loss_list = []
-
-            # computing and saving loss landscape plots
             model_perb = copy.deepcopy(model).to(device)
             for lam in lams:
                 model_perb = get_params(model, model_perb, top_eigenvector[0], lam)
                 loss_val, _ = full_loss(model_perb, train, device)
                 loss_list.append(loss_val.item())
+            
             # exp_name = f"{now}__{tag}__{short_hash}"
             
-            exp_name = " | ".join(
-                ["_".join(f"{v}" for k, v in vars(s).items())
-                for s in sizes]) + f"@step{exp_freq}"
-            exp_path = os.path.join(log_dir, exp_name, f"seed_{seed}")
-            
-            
+        
+            # PLOTTING & SAVING LOSS LANDSCAPE PLOTS
             plt.plot(lams, loss_list)
             plt.xlabel("Perturbation")
             plt.ylabel("Loss")
@@ -231,7 +279,6 @@ def train_and_plot(sizes,
                              train_acc=f"{train_acc:.3f}",
                              w_norm=f"{weight_norm:.3f}",
                              g_norm=f"{grad_norm:.3f}")
-
         optimizer.step()
         optimizer.zero_grad()
 
@@ -418,4 +465,4 @@ if __name__ == "__main__":
 
             print(f"Training {sizes}")
 
-            train_and_plot(sizes, train, test, 5_000, -1, log_dir=log_dir,exp_thres=et, seed=seed)
+            train_and_plot(sizes, train, test, 1_000, -1, log_dir=log_dir,exp_thres=et, seed=seed)
