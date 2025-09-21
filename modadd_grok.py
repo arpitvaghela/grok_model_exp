@@ -19,7 +19,7 @@ from datetime import datetime
 import hashlib
 import json
 
-from pyhessian import hessian
+from hessian import hessian
 import copy
 
 from model import params_pad_to_shape, Transformer, GradientLogger
@@ -104,11 +104,13 @@ def train_and_plot(sizes,
     size_index = 0
     
     # PATH VARIABLES / SPECIFICATIONS
-    exp_name = " | ".join(
-                ["_".join(f"{v}" for k, v in vars(s).items())
-                for s in sizes]) + f"@step{exp_freq}"
-    exp_path = os.path.join(log_dir, exp_name, f"seed_{seed}")
-    os.makedirs(exp_path, exist_ok=True)
+    # exp_path = os.path.join(log_dir, exp_name, f"seed_{seed}")
+    weight_hist_dir = os.path.join(log_dir, "weight_hist")
+    loss_land_dir = os.path.join(log_dir, "loss_landscapes")
+
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(weight_hist_dir, exist_ok=True)
+    os.makedirs(loss_land_dir, exist_ok=True)
 
     # INITIAL MODEL
     model = Transformer(
@@ -141,21 +143,6 @@ def train_and_plot(sizes,
                     "g_norm": 0
                 })
     for epoch in pbar:
-        # MAKING DIRECTORY
-        exp_name = " | ".join(
-        ["_".join(f"{v}" for k, v in vars(s).items())
-        for s in sizes]) + f"@step{exp_freq}"
-        exp_path = os.path.join(log_dir, exp_name, f"seed_{seed}")
-        os.makedirs(exp_path, exist_ok=True)
-        
-        # CAPTURING WEIGHTS (HISTOGRAM COUNTS) PRE-EXPANSION
-        if epoch % 30 == 0:
-            pre_exp_weight_hist = get_histogram_counts(model, bins=1000)
-            torch.save(pre_exp_weight_hist, f"pre-weights-{epoch}.pt")
-            pre_exp_weight_hist_dir = os.path.join(exp_path, "pre_exp_weight_hist")
-            os.makedirs(pre_exp_weight_hist_dir, exist_ok=True)
-            shutil.move(f"pre-weights-{epoch}.pt", pre_exp_weight_hist_dir)
-        
         # CONDITION FOR EXPANSION
         # if epoch % exp_freq == 0:
         if len(test_accuracies
@@ -216,20 +203,9 @@ def train_and_plot(sizes,
                 mean_attn = mean_attn.mean(dim=0)  # Average across batches
                 attention_scores.append(mean_attn.cpu().numpy())
 
-
-                # MAKING DIRECTORY
-                exp_name = " | ".join(
-                ["_".join(f"{v}" for k, v in vars(s).items())
-                for s in sizes]) + f"@step{exp_freq}"
-                exp_path = os.path.join(log_dir, exp_name, f"seed_{seed}")
-                os.makedirs(exp_path, exist_ok=True)
-
-                # CAPTURING WEIGHTS (HISTOGRAM COUNTS) POST-EXPANSION
-                post_exp_weight_hist = get_histogram_counts(model, bins=1000)
-                torch.save(post_exp_weight_hist, f"post-weight-{epoch}.pt")
-                post_exp_weight_hist_dir = os.path.join(exp_path, "post_exp_weight_hist")
-                os.makedirs(post_exp_weight_hist_dir, exist_ok=True)
-                shutil.move(f"post-weight-{epoch}.pt", post_exp_weight_hist_dir)
+                # CAPTURING WEIGHTS (HISTOGRAM COUNTS)
+                weight_hist = get_histogram_counts(model, bins=1000)
+                torch.save(weight_hist, os.path.join(weight_hist_dir, f"weight-{epoch}.pt"))
 
             # HESSIAN COMPUTATION
             criterion = torch.nn.functional.cross_entropy
@@ -242,7 +218,7 @@ def train_and_plot(sizes,
             top_hessian_eigenvalues.append(eigenvalues_np)
 
             # COMPUTING + SAVING LOSS LANDSCAPE
-            lams = np.linspace(-0.5, 0.5, 21).astype(np.float32)
+            lams = np.linspace(-1, 1, 51).astype(np.float32)
             loss_list = []
             model_perb = copy.deepcopy(model).to(device)
             for lam in lams:
@@ -258,7 +234,6 @@ def train_and_plot(sizes,
             plt.xlabel("Perturbation")
             plt.ylabel("Loss")
             plt.title(f"Epoch {epoch} loss landscape")
-            loss_land_dir = os.path.join(exp_path, "loss_landscapes")
             os.makedirs(loss_land_dir, exist_ok=True)
             plt.savefig(os.path.join(loss_land_dir,f"landscape_epoch{epoch}.png"))
             plt.close()
@@ -282,12 +257,12 @@ def train_and_plot(sizes,
         optimizer.step()
         optimizer.zero_grad()
 
-    grad_logger.save(path=os.path.join(exp_path, "grads.pt"))
+    grad_logger.save(path=os.path.join(log_dir, "grads.pt"))
     grad_logger.plot_grad_norms()
     grad_logger.plot_grad_hist()
 
     # save hessian eigenvalue array
-    np.save(os.path.join(exp_path, "hessian_eigenvalues"), 
+    np.save(os.path.join(log_dir, "hessian_eigenvalues"), 
             np.array(top_hessian_eigenvalues))
     
     # Pad attention scores to match largest shape before storing
@@ -319,29 +294,16 @@ def train_and_plot(sizes,
         "attention_scores": attention_scores
     }
 
-    now = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    tag = "1L_modadd"
-    raw_string = "\n".join(
-        ["_".join(f"{k}_{v}" for k, v in vars(s).items()) for s in sizes])
-    short_hash = hashlib.md5(
-        raw_string.encode()).hexdigest()[-6:].upper()  # e.g. 'E1234A'
 
-    # exp_name = f"{now}__{tag}__{short_hash}"
-    exp_name = " | ".join(
-        ["_".join(f"{v}" for k, v in vars(s).items())
-         for s in sizes]) + f"@step{exp_freq}"
-    exp_path = os.path.join(log_dir, exp_name)
-
-    os.makedirs(exp_path, exist_ok=True)
     # Save numpy arrays using numpy's save format
-    np.save(os.path.join(exp_path, "attention_scores.npy"),
+    np.save(os.path.join(log_dir, "attention_scores.npy"),
             np.array(data["attention_scores"]))
 
     # Save rest of data as JSON, excluding the numpy arrays
     data_json = data.copy()
     del data_json["attention_scores"]
 
-    with open(os.path.join(exp_path, "config.json"), "w") as f:
+    with open(os.path.join(log_dir, "config.json"), "w") as f:
         json.dump(data_json, f, indent=2)
 
     # Create figure with subplots
@@ -385,36 +347,9 @@ def train_and_plot(sizes,
     ax1.set_xscale('log')
     ax1_2.legend(loc=(0.015, 0.72))
 
-    # # Plot attention heatmap
-    # attention_scores = np.array(attention_scores) # shape b,i,q,h
-
-    # scores_2d = attention_scores.mean(axis=(0,3)) # average over batch and heads: result shape (i, q)
-
-    # sns.heatmap( # attention_scores.T, 
-    #             scores_2d,
-    #             ax=ax2,
-    #             cmap='viridis',
-    #             xticklabels=log_steps[::len(log_steps) // 10],
-    #             yticklabels=[
-    #                 'pos ' + str(i) for i in range(attention_scores.shape[1])
-    #             ])
-    # ax2.set_xlabel('Training Step')
-    # ax2.set_ylabel('Position')
-    # ax2.set_title('Attention Scores Over Training')
-
-    # size_str = "dmodel,dmlp,nhead: " + " | ".join(
-    #     ["_".join(f"{v}" for k, v in vars(s).items()) for s in sizes])
-    # fig.suptitle("1L Transformer on Modular Addition (p=113)\n" + size_str +
-    #              f"\nexp@{exp_freq} t-{t_steps}",
-    #              fontsize=8)
-    # plt.tight_layout()
-    # plt.savefig(os.path.join(log_dir, exp_name, "plot.png"), dpi=300)
-    # plt.close()
-
-
 if __name__ == "__main__":
 
-    for seed in [42]: # , 66, 94, 17, 31]:
+    for seed in [66]: # , 66, 94, 17, 31]:
         p = 113
         fraction = 0.3
 
@@ -459,10 +394,13 @@ if __name__ == "__main__":
         for base, target, et in itertools.product(base_sizes, target_sizes, exp_thresholds):
             sizes = [ModelSpec(base[0], base[1], base[2]), ModelSpec(target[0], target[1], target[2])]
 
-            # exp_name = " | ".join(["_".join(f"{v}" for k, v in vars(s).items()) for s in sizes])
-            log_dir = os.path.join("log", "modadd", "exp",f"thres_{et}")
+            exp_name = ">".join(
+                ["_".join(f"{v}" for k, v in vars(s).items())
+                for s in sizes])
+
+            log_dir = os.path.join("log", "modadd", "exp",f"thres_{et}", exp_name, f"seed_{seed}")
             os.makedirs(log_dir, exist_ok=True)
 
             print(f"Training {sizes}")
 
-            train_and_plot(sizes, train, test, 1_000, -1, log_dir=log_dir,exp_thres=et, seed=seed)
+            train_and_plot(sizes, train, test, 10_000, -1, log_dir=log_dir,exp_thres=et, seed=seed)

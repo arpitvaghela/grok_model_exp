@@ -23,7 +23,7 @@ import math
 from torch.autograd import Variable
 import numpy as np
 
-from pyhessian.utils import group_product, group_add, normalization, get_params_grad, hessian_vector_product, orthnormal
+from hessian_utils import group_product, group_add, normalization, get_params_grad, hessian_vector_product, orthnormal
 
 
 class hessian():
@@ -88,7 +88,7 @@ class hessian():
         for inputs, targets in self.data:
             self.model.zero_grad()
             tmp_num_data = inputs.size(0)
-            outputs = self.model(inputs.to(device))
+            outputs, _ = self.model(inputs.to(device))
             loss = self.criterion(outputs, targets.to(device))
             loss.backward(create_graph=True)
             params, gradsH = get_params_grad(self.model)
