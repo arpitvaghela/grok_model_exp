@@ -1,4 +1,5 @@
 import os
+import shutil
 import random
 import time
 
@@ -17,6 +18,9 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
+
+from hessian import hessian
+import copy
 
 from model import params_pad_to_shape, Transformer, GradientLogger
 import itertools
@@ -48,7 +52,7 @@ def full_loss(model, data, device):
     x = x.to(device)
     labels = labels.to(device)
     logits, attn_scores_masked = model(x)
-    logits = logits[:, -1]
+    # logits = logits[:, -1]
     return torch.nn.functional.cross_entropy(logits, labels), attn_scores_masked
 
 def full_accuracy(model, data, device):
@@ -57,10 +61,26 @@ def full_accuracy(model, data, device):
     x, labels = next(iter(loader))
     x = x.to(device)
     labels = labels.to(device)
-    logits = model(x)[0][:, -1]
+    logits = model(x)[0] #[:, -1]
     predictions = torch.argmax(logits, dim=1)
     return torch.sum(predictions == labels).item() / len(labels)
 
+# GET MODEL PARAMETERS FOR HESSIAN CALCULATION
+def get_params(model_orig, model_perb, direction, alpha):
+    for m_orig, m_perb, d in zip(model_orig.parameters(), model_perb.parameters(), direction):
+        m_perb.data = m_orig.data + alpha * d
+    return model_perb
+
+def get_histogram_counts(model, bins=1000):
+    histograms = {}
+    for name, param in model.named_parameters():
+        values = param.detach().cpu().flatten().numpy()
+        counts, bin_edges = np.histogram(values, bins=bins)
+        histograms[name] = {
+            "counts": counts,
+            "bin_edges": bin_edges
+        }
+    return histograms
 
 def train_and_plot(sizes,
                    train,
@@ -68,7 +88,8 @@ def train_and_plot(sizes,
                    t_steps=5000,
                    exp_freq=None,
                    exp_thres=0.2,
-                   log_dir="./logs/"):
+                   log_dir="./logs/", 
+                   seed=42):
     log_steps = []
     train_losses = []
     test_losses = []
@@ -77,10 +98,21 @@ def train_and_plot(sizes,
     norms = []
     grad_norms = []
     attention_scores = []
-
+    top_hessian_eigenvalues = []
     # if not exp_freq:
     #     exp_freq = t_steps // len(sizes)
     size_index = 0
+    
+    # PATH VARIABLES / SPECIFICATIONS
+    # exp_path = os.path.join(log_dir, exp_name, f"seed_{seed}")
+    weight_hist_dir = os.path.join(log_dir, "weight_hist")
+    loss_land_dir = os.path.join(log_dir, "loss_landscapes")
+
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(weight_hist_dir, exist_ok=True)
+    os.makedirs(loss_land_dir, exist_ok=True)
+
+    # INITIAL MODEL
     model = Transformer(
         num_layers=1,
         d_vocab=equals_token + 1,
@@ -111,17 +143,20 @@ def train_and_plot(sizes,
                     "g_norm": 0
                 })
     for epoch in pbar:
+        # CONDITION FOR EXPANSION
         # if epoch % exp_freq == 0:
         if len(test_accuracies
                ) and test_accuracies[-1] > exp_thres and size_index == 0:
             # idx = epoch // exp_freq
             size_index = 1
             exp_freq = epoch
+
             if size_index > 0 and size_index < len(sizes):
                 print(
                     f"@epoch {epoch}\t{sizes[size_index -1]} -> {sizes[size_index]}"
                 )
-
+                
+                # MODEL EXPANDS HERE
                 model_2 = Transformer(
                     num_layers=1,
                     d_vocab=equals_token + 1,
@@ -168,6 +203,41 @@ def train_and_plot(sizes,
                 mean_attn = mean_attn.mean(dim=0)  # Average across batches
                 attention_scores.append(mean_attn.cpu().numpy())
 
+                # CAPTURING WEIGHTS (HISTOGRAM COUNTS)
+                weight_hist = get_histogram_counts(model, bins=1000)
+                torch.save(weight_hist, os.path.join(weight_hist_dir, f"weight-{epoch}.pt"))
+
+            # HESSIAN COMPUTATION
+            criterion = torch.nn.functional.cross_entropy
+            train_loader = torch.utils.data.DataLoader(train, batch_size=len(train), shuffle=False)
+            hessian_comp = hessian(model=model, criterion=criterion, cuda=True, dataloader=train_loader)
+            top_eigenvalues, top_eigenvector = hessian_comp.eigenvalues()
+
+            # CALCULATING TOP HESSIAN EIGENVALUES
+            eigenvalues_np = np.array(top_eigenvalues)
+            top_hessian_eigenvalues.append(eigenvalues_np)
+
+            # COMPUTING + SAVING LOSS LANDSCAPE
+            lams = np.linspace(-1, 1, 51).astype(np.float32)
+            loss_list = []
+            model_perb = copy.deepcopy(model).to(device)
+            for lam in lams:
+                model_perb = get_params(model, model_perb, top_eigenvector[0], lam)
+                loss_val, _ = full_loss(model_perb, train, device)
+                loss_list.append(loss_val.item())
+            
+            # exp_name = f"{now}__{tag}__{short_hash}"
+            
+        
+            # PLOTTING & SAVING LOSS LANDSCAPE PLOTS
+            plt.plot(lams, loss_list)
+            plt.xlabel("Perturbation")
+            plt.ylabel("Loss")
+            plt.title(f"Epoch {epoch} loss landscape")
+            os.makedirs(loss_land_dir, exist_ok=True)
+            plt.savefig(os.path.join(loss_land_dir,f"landscape_epoch{epoch}.png"))
+            plt.close()
+
         train_loss.backward()
 
         if epoch % 30 == 0:
@@ -184,13 +254,16 @@ def train_and_plot(sizes,
                              train_acc=f"{train_acc:.3f}",
                              w_norm=f"{weight_norm:.3f}",
                              g_norm=f"{grad_norm:.3f}")
-
         optimizer.step()
         optimizer.zero_grad()
 
-    grad_logger.save("grads.pt")
+    grad_logger.save(path=os.path.join(log_dir, "grads.pt"))
     grad_logger.plot_grad_norms()
     grad_logger.plot_grad_hist()
+
+    # save hessian eigenvalue array
+    np.save(os.path.join(log_dir, "hessian_eigenvalues"), 
+            np.array(top_hessian_eigenvalues))
     
     # Pad attention scores to match largest shape before storing
     if attention_scores:
@@ -221,98 +294,62 @@ def train_and_plot(sizes,
         "attention_scores": attention_scores
     }
 
-    now = datetime.now().strftime("%Y-%m-%d_%H-%M")
-    tag = "1L_modadd"
-    raw_string = "\n".join(
-        ["_".join(f"{k}_{v}" for k, v in vars(s).items()) for s in sizes])
-    short_hash = hashlib.md5(
-        raw_string.encode()).hexdigest()[-6:].upper()  # e.g. 'E1234A'
 
-    # exp_name = f"{now}__{tag}__{short_hash}"
-    exp_name = " | ".join(
-        ["_".join(f"{v}" for k, v in vars(s).items())
-         for s in sizes]) + f"@step{exp_freq}"
-    exp_path = os.path.join(log_dir, exp_name)
-
-    os.makedirs(exp_path, exist_ok=True)
     # Save numpy arrays using numpy's save format
-    np.save(os.path.join(exp_path, "attention_scores.npy"),
+    np.save(os.path.join(log_dir, "attention_scores.npy"),
             np.array(data["attention_scores"]))
 
     # Save rest of data as JSON, excluding the numpy arrays
     data_json = data.copy()
     del data_json["attention_scores"]
 
-    with open(os.path.join(exp_path, "config.json"), "w") as f:
+    with open(os.path.join(log_dir, "config.json"), "w") as f:
         json.dump(data_json, f, indent=2)
 
-    # # Create figure with subplots
-    # fig, (ax1, ax2) = plt.subplots(2,
-    #                                1,
-    #                                figsize=(10, 12),
-    #                                height_ratios=[2, 1])
+    # Create figure with subplots
+    fig, (ax1, ax2) = plt.subplots(2,
+                                   1,
+                                   figsize=(10, 12),
+                                   height_ratios=[2, 1])
 
-    # # Plot accuracies and norms
-    # expansion_steps = [exp_freq * i for i in range(1, len(sizes))]
+    # Plot accuracies and norms
+    expansion_steps = [exp_freq * i for i in range(1, len(sizes))]
 
-    # ax1.plot(log_steps, train_accuracies, color='red', label='train')
-    # ax1.plot(log_steps, test_accuracies, color='green', label='test')
+    ax1.plot(log_steps, train_accuracies, color='red', label='train')
+    ax1.plot(log_steps, test_accuracies, color='green', label='test')
 
-    # if any(a >= 0.95 for a in test_accuracies):
-    #     time_to_95_pct_test = log_steps[min(
-    #         i for i, acc in enumerate(test_accuracies) if acc >= 0.95)]
-    #     ax1.plot([time_to_95_pct_test] * 2, [0, 1],
-    #              color='green',
-    #              linestyle='--')
-    #     ax1.text(time_to_95_pct_test + 10, 0.65,
-    #              f"@{time_to_95_pct_test} test acc\nhits 95%")
+    if any(a >= 0.95 for a in test_accuracies):
+        time_to_95_pct_test = log_steps[min(
+            i for i, acc in enumerate(test_accuracies) if acc >= 0.95)]
+        ax1.plot([time_to_95_pct_test] * 2, [0, 1],
+                 color='green',
+                 linestyle='--')
+        ax1.text(time_to_95_pct_test + 10, 0.65,
+                 f"@{time_to_95_pct_test} test acc\nhits 95%")
 
-    # for step in expansion_steps:
-    #     ax1.axvline(x=step,
-    #                 color='blue',
-    #                 linestyle='dotted',
-    #                 linewidth=1,
-    #                 alpha=0.2)
+    for step in expansion_steps:
+        ax1.axvline(x=step,
+                    color='blue',
+                    linestyle='dotted',
+                    linewidth=1,
+                    alpha=0.2)
 
-    # ax1.legend()
-    # ax1.set_xlabel("Optimization Steps")
-    # ax1.set_ylim(0, 1)
-    # ax1.set_ylabel("Accuracy")
+    ax1.legend()
+    ax1.set_xlabel("Optimization Steps")
+    ax1.set_ylim(0, 1)
+    ax1.set_ylabel("Accuracy")
 
-    # ax1_2 = ax1.twinx()
-    # ax1_2.set_ylabel("Weight/Grad Norm", color='purple')
-    # ax1_2.plot(log_steps, norms, color='purple', label='weight norm')
-    # ax1_2.plot(log_steps, grad_norms, color='orange', label='grad norm')
-    # ax1_2.set_ylim(27, 63)
-    # ax1.set_xscale('log')
-    # ax1_2.legend(loc=(0.015, 0.72))
-
-    # # Plot attention heatmap
-    # attention_scores = np.array(attention_scores) # shape b,i,q,h
-    # sns.heatmap(attention_scores.T,
-    #             ax=ax2,
-    #             cmap='viridis',
-    #             xticklabels=log_steps[::len(log_steps) // 10],
-    #             yticklabels=[
-    #                 'pos ' + str(i) for i in range(attention_scores.shape[1])
-    #             ])
-    # ax2.set_xlabel('Training Step')
-    # ax2.set_ylabel('Position')
-    # ax2.set_title('Attention Scores Over Training')
-
-    # size_str = "dmodel,dmlp,nhead: " + " | ".join(
-    #     ["_".join(f"{v}" for k, v in vars(s).items()) for s in sizes])
-    # fig.suptitle("1L Transformer on Modular Addition (p=113)\n" + size_str +
-    #              f"\nexp@{exp_freq} t-{t_steps}",
-    #              fontsize=8)
-    # plt.tight_layout()
-    # plt.savefig(os.path.join(log_dir, exp_name, "plot.png"), dpi=300)
-    # plt.close()
-
+    ax1_2 = ax1.twinx()
+    ax1_2.set_ylabel("Weight/Grad Norm", color='purple')
+    ax1_2.plot(log_steps, norms, color='purple', label='weight norm')
+    ax1_2.plot(log_steps, grad_norms, color='orange', label='grad norm')
+    ax1_2.set_ylim(27, 63)
+    ax1.set_xscale('log')
+    ax1_2.legend(loc=(0.015, 0.72))
 
 if __name__ == "__main__":
 
-    for seed in [42]: # , 66, 94, 17, 31]:
+    for seed in [66]: # , 66, 94, 17, 31]:
         p = 113
         fraction = 0.3
 
@@ -345,8 +382,8 @@ if __name__ == "__main__":
         exp_thresholds = [0.1] # [0.1, 0.25, 0.4]
 
         # log_dir = f"log/modadd/base/seed_{seed}"
-        log_dir = os.path.join("log", "modadd", "base", f"seed_{seed}")
-        os.makedirs(log_dir, exist_ok=True)
+        # log_dir = os.path.join("log", "modadd", "base", f"seed_{seed}")
+        # os.makedirs(log_dir, exist_ok=True)
 
         # for size in base_sizes + target_sizes:
         #     sizes = [ModelSpec(size[0], size[1], size[2])]
@@ -357,10 +394,13 @@ if __name__ == "__main__":
         for base, target, et in itertools.product(base_sizes, target_sizes, exp_thresholds):
             sizes = [ModelSpec(base[0], base[1], base[2]), ModelSpec(target[0], target[1], target[2])]
 
-            # exp_name = " | ".join(["_".join(f"{v}" for k, v in vars(s).items()) for s in sizes])
-            log_dir = os.path.join("log", "modadd", "exp",f"thres_{et}" ,f"seed_{seed}")
+            exp_name = ">".join(
+                ["_".join(f"{v}" for k, v in vars(s).items())
+                for s in sizes])
+
+            log_dir = os.path.join("log", "modadd", "exp",f"thres_{et}", exp_name, f"seed_{seed}")
             os.makedirs(log_dir, exist_ok=True)
 
             print(f"Training {sizes}")
 
-            train_and_plot(sizes, train, test, 5_000, -1, log_dir=log_dir,exp_thres=et)
+            train_and_plot(sizes, train, test, 10_000, -1, log_dir=log_dir,exp_thres=et, seed=seed)
